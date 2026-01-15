@@ -1,14 +1,20 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use axum::{routing::get, Router};
+use std::net::SocketAddr;
+use tracing::info;
+
+pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let app = Router::new()
+        .route("/health", get(health_check));
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    info!("🚀 XDR Proxy listening on http://{}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+async fn health_check() -> &'static str {
+    "OK"
 }
