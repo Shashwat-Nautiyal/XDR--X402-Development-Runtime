@@ -30,7 +30,11 @@ enum Commands {
         action: ChaosAction,
     },
     /// Show current status of the runtime
-    Status,
+    Status{
+        /// The Agent ID to query
+        #[arg(short, long)]
+        agent: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -76,9 +80,20 @@ async fn main() -> Result<()> {
                 ChaosAction::Disable => info!(event = "config_change", "Chaos mode DISABLED"),
             }
         }
-        Commands::Status => {
-            // Stub response for now
-            println!("{{ \"status\": \"online\", \"agents_active\": 0 }}");
+        Commands::Status { agent } => {
+            let url = format!("http://localhost:{}/_xdr/status/{}", cli.port, agent);
+            match reqwest::get(&url).await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        let body = resp.text().await.unwrap_or_default();
+                        println!("{}", body);
+                    } else {
+                        // NEW: Print the actual status code (e.g., 404 or 400)
+                        eprintln!("❌ Error [{}]: Agent '{}' not found.", resp.status(), agent);
+                    }
+                }
+                Err(e) => eprintln!("❌ Connection failed: {}", e),
+            }
         }
     }
 

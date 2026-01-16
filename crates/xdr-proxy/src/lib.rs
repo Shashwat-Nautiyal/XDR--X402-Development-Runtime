@@ -1,18 +1,19 @@
 use axum::{
     body::Body,
-    extract::Request,
-    http::{HeaderMap, HeaderValue, StatusCode, Uri},
-    response::{IntoResponse, Response},
-    routing::any,
+    extract::{Path, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response, Json},
+    routing::{any, get},
     Router,
 };
 use reqwest::Client;
 use std::net::SocketAddr;
-use std::str::FromStr;
+// removed unused std::str::FromStr
 use std::time::Instant;
 use tower_http::trace::{self, TraceLayer};
 use tracing::{error, info, warn, Level};
 use url::Url;
+use xdr_ledger::Ledger;
 
 // --- Constants ---
 const HEADER_UPSTREAM_HOST: &str = "x-upstream-host";
@@ -22,6 +23,7 @@ const HEADER_AGENT_ID: &str = "x-agent-id";
 #[derive(Clone)]
 struct AppState {
     client: Client,
+    ledger: Ledger,
 }
 
 // --- Classification Enum (The Hook) ---
@@ -39,10 +41,13 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
-    let state = AppState { client };
+    let ledger = Ledger::new();
+    let state = AppState { client, ledger };
 
     let app = Router::new()
-        // Catch-all handler
+        // 1. Management Routes (Internal)
+        .route("/_xdr/status/:agent_id", get(get_agent_status))
+        // 2. Proxy Routes (Catch-all)
         .route("/*path", any(proxy_handler)) 
         .layer(
             TraceLayer::new_for_http()
@@ -61,22 +66,42 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn get_agent_status(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> impl IntoResponse {
+    match state.ledger.get_state(&agent_id) {
+        Some(agent) => Json(agent).into_response(),
+        None => (StatusCode::NOT_FOUND, "Agent not found").into_response(),
+    }
+}
+
 async fn proxy_handler(
     state: axum::extract::State<AppState>,
     mut req: Request,
 ) -> impl IntoResponse {
     let start_time = Instant::now();
     
-    // 1. EXTRACT AGENT IDENTITY (Optional for now, but logged)
-    let agent_id = req.headers()
-        .get(HEADER_AGENT_ID)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("anonymous")
-        .to_string();
+    // 1. ENFORCE AGENT IDENTITY
+    let agent_id = match req.headers().get(HEADER_AGENT_ID).and_then(|h| h.to_str().ok()) {
+        Some(id) => id.to_string(),
+        None => {
+            warn!(target: "xdr_proxy", "⚠️ Rejected request missing {}", HEADER_AGENT_ID);
+            return (
+                StatusCode::BAD_REQUEST, 
+                format!("Missing mandatory header: {}", HEADER_AGENT_ID)
+            ).into_response();
+        }
+    };
 
-    // 2. RESOLVE UPSTREAM URL
+    
+    // 2. REGISTER / UPDATE LEDGER
     // Priority 1: Absolute URL (e.g. from curl proxy or RPC)
-    // Priority 2: X-Upstream-Host header + Request Path
+    // Priority 2: X-Upstream-Host header + Requ// 2. REGISTER / UPDATE LEDGER
+    // This creates the agent in memory if it's their first request
+    let _agent_state = state.ledger.register_or_get(&agent_id);
+
+    // RESOLVE UPSTREAM URL
     let upstream_url = match resolve_upstream_url(&req) {
         Ok(url) => url,
         Err(err_msg) => {
@@ -138,7 +163,8 @@ async fn proxy_handler(
     *response_builder.headers_mut().unwrap() = resp_headers;
     
     info!(
-        target: "xdr_proxy", 
+        target: "xdr_proxy",
+        agent_id = %agent_id,
         "⬅️  [{}] {} ({}ms)", 
         status,
         upstream_url, 
