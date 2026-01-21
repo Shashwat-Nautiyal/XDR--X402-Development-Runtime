@@ -9,12 +9,15 @@ use axum::{
 };
 use reqwest::Client;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
 use std::time::Instant;
 use tower_http::trace::{self, TraceLayer};
 use tracing::{error, info, warn, Level};
 use url::Url;
 use xdr_ledger::Ledger;
 use xdr_chaos::{ChaosEngine, ChaosConfig};
+use xdr_trace::{Trace, EventCategory};
 use serde_json::json; 
 
 // --- Constants ---
@@ -28,6 +31,7 @@ struct AppState {
     client: Client,
     ledger: Ledger,
     chaos: ChaosEngine,
+    traces: Arc<Mutex<VecDeque<Trace>>>,
 }
 
 // --- Classification Enum ---
@@ -61,13 +65,15 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 
     let ledger = Ledger::new();
     let chaos = ChaosEngine::new();
-    let state = AppState { client, ledger, chaos };
+    let traces = Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
+    let state = AppState { client, ledger, chaos, traces };
 
     let app = Router::new()
         // 1. Management Routes (Internal)
         .route("/_xdr/status/:agent_id", get(get_agent_status))
         .route("/_xdr/budget/:agent_id", post(set_agent_budget))
         .route("/_xdr/chaos", post(update_chaos_config))
+        .route("/_xdr/traces", get(get_traces))
         // 2. Proxy Routes (Catch-all)
         .route("/*path", any(proxy_handler)) 
         .layer(
@@ -102,6 +108,12 @@ async fn update_chaos_config(
 ) -> impl IntoResponse {
     state.chaos.set_config(payload);
     StatusCode::OK
+}
+
+async fn get_traces(State(state): State<AppState>) -> impl IntoResponse {
+    let traces = state.traces.lock().unwrap();
+    // Return the list (JSON)
+    Json(traces.clone()).into_response()
 }
 
 async fn proxy_handler(
@@ -143,73 +155,111 @@ async fn proxy_handler(
         return (StatusCode::from_u16(status_code).unwrap(), "Chaos: Network Error").into_response();
     }
 
-    // 5. x402 PAYMENT SEMANTICS ENGINE
-    // Trigger condition: Path contains "paid" OR Header set
+    let mut trace = Trace::new("unknown", req.method().as_str(), &req.uri().to_string());
+    
+    // Helper macro to save typing
+    macro_rules! record {
+        ($cat:expr, $msg:expr) => { trace.log($cat, &$msg) };
+    }
+
+    // 1. CHAOS (Latency)
+    state.chaos.inject_latency().await;
+    
+    // 2. CHAOS (Network Failure)
+    if let Some(status_code) = state.chaos.roll_network_failure() {
+        record!(EventCategory::Chaos, format!("Injected Network Failure: {}", status_code));
+        trace.finish(status_code);
+        state.traces.lock().unwrap().push_back(trace); // Commit trace
+        return (StatusCode::from_u16(status_code).unwrap(), "Chaos Error").into_response();
+    }
+
+    // 3. IDENTITY
+    let agent_id = match req.headers().get(HEADER_AGENT_ID).and_then(|h| h.to_str().ok()) {
+        Some(id) => id.to_string(),
+        None => {
+            record!(EventCategory::Error, "Missing X-Agent-ID header".to_string());
+            trace.finish(400);
+            state.traces.lock().unwrap().push_back(trace);
+            return (StatusCode::BAD_REQUEST, "Missing X-Agent-ID").into_response();
+        }
+    };
+    trace.agent_id = agent_id.clone(); // Update correct ID
+    record!(EventCategory::Info, format!("Agent identified: {}", agent_id));
+
+    // 4. REGISTER
+    state.ledger.register_or_get(&agent_id);
+
+    // 5. PAYMENT LOGIC
     let should_gate = req.uri().path().contains("paid") 
                    || req.headers().contains_key(HEADER_SIMULATE_PAYMENT);
 
     if should_gate {
-        // Check for L402 Token
         let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
-        
         match auth_header {
             Some(token) if token.starts_with("L402") => {
-                // A. PAYMENT ATTEMPT
+                // Payment Chaos
+                if state.chaos.roll_payment_failure() {
+                    record!(EventCategory::Chaos, "Payment transaction failed on-chain".to_string());
+                    trace.finish(402);
+                    state.traces.lock().unwrap().push_back(trace);
+                    return (StatusCode::PAYMENT_REQUIRED, "Chaos: Payment Failed").into_response();
+                }
+
                 let invoice_id = token.replace("L402 ", "");
                 match state.ledger.pay_invoice(&invoice_id, &agent_id) {
-                    Ok(new_bal) => {
-                        info!(target: "xdr_payment", "💰 Payment Verified. Agent: {} Balance: ${:.2}", agent_id, new_bal);
+                    Ok(bal) => {
+                        record!(EventCategory::Payment, format!("Payment accepted. Bal: ${:.2}", bal));
+                        
+                        // Rug Chaos
                         if state.chaos.roll_rug_pull() {
-                             warn!(target: "xdr_chaos", "💥 RUG PULL: Payment taken, service denied.");
-                             return (StatusCode::INTERNAL_SERVER_ERROR, "Chaos: Service Crashed After Payment").into_response();
+                             record!(EventCategory::Chaos, "RUG PULL: Payment taken, request dropped".to_string());
+                             trace.finish(500);
+                             state.traces.lock().unwrap().push_back(trace);
+                             return (StatusCode::INTERNAL_SERVER_ERROR, "Rug Pull").into_response();
                         }
-                        // Clean headers so upstream doesn't see our fake token
+                        
                         req.headers_mut().remove("Authorization");
-                        // Fall through to proxy logic...
                     },
                     Err(e) => {
-                       warn!(target: "xdr_payment", "🛑 BLOCKING: Agent {} - {}", agent_id, e);
+                        record!(EventCategory::Payment, format!("Payment rejected: {}", e));
+                        trace.finish(402);
+                        state.traces.lock().unwrap().push_back(trace);
                         
-                        let body = json!({
-                            "status": 402,
-                            "error": "Payment Failed",
-                            "reason": e, // "Wallet Exhausted" or "Safety Limit"
-                            "agent": agent_id
-                        });
+                        // Copy the specific budget error logic from Stage 5 here
+                        let body = json!({ "status": 402, "error": e, "agent": agent_id });
                         return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
                     }
                 }
             },
             _ => {
-                // B. PAYMENT REQUIRED (CHALLENGE)
-                let amount = 0.01;
-                let invoice = state.ledger.create_invoice(&agent_id, amount);
+                // Generate Invoice
+                let invoice = state.ledger.create_invoice(&agent_id, 0.01);
+                record!(EventCategory::Payment, format!("Generated Invoice: {}", invoice.id));
+                trace.finish(402);
+                state.traces.lock().unwrap().push_back(trace);
                 
-                info!(target: "xdr_payment", "🛑 Gating Request. Invoice: {} Cost: ${}", invoice.id, amount);
-
-                let body = json!({
-                    "status": 402,
-                    "x402_invoice": invoice.id,
-                    "amount": format!("{:.2} USDC", amount),
-                    "chain": "cronos-testnet"
-                });
-
+                // Copy the L402 response logic here
+                let body = json!({ "status": 402, "x402_invoice": invoice.id });
                 let mut resp = Json(body).into_response();
                 *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
-                resp.headers_mut().insert(
-                    "WWW-Authenticate", 
-                    HeaderValue::from_str(&format!("L402 token={}", invoice.id)).unwrap()
-                );
+                resp.headers_mut().insert("WWW-Authenticate", HeaderValue::from_str(&format!("L402 token={}", invoice.id)).unwrap());
                 return resp;
             }
         }
     }
 
-    // 6. RESOLVE UPSTREAM URL
+    // 6. UPSTREAM
     let upstream_url = match resolve_upstream_url(&req) {
-        Ok(url) => url,
-        Err(err_msg) => return (StatusCode::BAD_REQUEST, err_msg).into_response(),
+        Ok(u) => u,
+        Err(e) => {
+            record!(EventCategory::Error, format!("Resolution failed: {}", e));
+            trace.finish(400);
+            state.traces.lock().unwrap().push_back(trace);
+            return (StatusCode::BAD_REQUEST, e).into_response();
+        }
     };
+    
+    record!(EventCategory::Upstream, format!("Forwarding to {}", upstream_url));
 
     // 7. CLASSIFY & LOG
     let req_type = classify_request(&upstream_url, req.method());
@@ -226,23 +276,30 @@ async fn proxy_handler(
     let headers = req.headers().clone();
     let body = req.into_body();
 
-    let response = match state.client
-        .request(method, upstream_url.clone())
-        .headers(headers)
-        .body(reqwest::Body::wrap_stream(http_body_util::BodyExt::into_data_stream(body)))
-        .send()
-        .await 
-    {
+    let response = match state.client.request(method, upstream_url).headers(headers).body(reqwest::Body::wrap_stream(http_body_util::BodyExt::into_data_stream(body))).send().await {
         Ok(res) => res,
-        Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        Err(e) => {
+            record!(EventCategory::Upstream, format!("Upstream Failed: {}", e));
+            trace.finish(502);
+            state.traces.lock().unwrap().push_back(trace);
+            return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+        }
     };
 
     // 9. RETURN RESPONSE
     let status = response.status();
+    record!(EventCategory::Upstream, format!("Upstream responded: {}", status));
+    trace.finish(status.as_u16());
+
+    {
+        let mut store = state.traces.lock().unwrap();
+        if store.len() >= 1000 { store.pop_front(); } // Ring buffer logic
+        store.push_back(trace);
+    }
+
     let mut resp_headers = response.headers().clone();
     remove_hop_by_hop_headers(&mut resp_headers);
     let resp_body = Body::from_stream(response.bytes_stream());
-
     let mut response_builder = Response::builder().status(status);
     *response_builder.headers_mut().unwrap() = resp_headers;
     response_builder.body(resp_body).unwrap()

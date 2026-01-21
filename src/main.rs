@@ -4,6 +4,7 @@ use tracing_subscriber::FmtSubscriber;
 use anyhow::Result;
 use serde_json::json;
 use xdr_chaos::ChaosConfig;
+use xdr_trace::Trace;
 
 // 1. CLI Definition
 #[derive(Parser)]
@@ -43,6 +44,15 @@ enum Commands {
         #[arg(long)]
         set: f64,
     },
+    Logs {
+        /// Filter by Agent ID
+        #[arg(short, long)]
+        agent: Option<String>,
+        
+        /// Output Raw JSON
+        #[arg(long)]
+        json: bool,
+    }
 }
 
 #[derive(Subcommand)]
@@ -157,6 +167,34 @@ async fn main() -> Result<()> {
                 Ok(r) => eprintln!("❌ Server error: {}", r.status()),
                 Err(e) => eprintln!("❌ Connection failed: {}", e),
             }
+        }
+        Commands::Logs { agent, json } => {
+             let url = format!("http://localhost:{}/_xdr/traces", cli.port);
+             match reqwest::get(&url).await {
+                Ok(res) => {
+                    let traces: Vec<Trace> = res.json().await.unwrap_or_default();
+                    
+                    for trace in traces {
+                        // Filter
+                        if let Some(ref a) = agent {
+                            if &trace.agent_id != a { continue; }
+                        }
+                        
+                        if *json {
+                            println!("{}", serde_json::to_string(&trace).unwrap());
+                        } else {
+                            // Human Readable Format
+                            println!("------------------------------------------------");
+                            println!("🆔 [{}] {} {}", trace.status_code.unwrap_or(0), trace.method, trace.url);
+                            println!("   Agent: {} | Duration: {}ms", trace.agent_id, trace.duration_ms.unwrap_or(0));
+                            for event in trace.events {
+                                println!("   - [{:?}] {}", event.category, event.message);
+                            }
+                        }
+                    }
+                },
+                Err(_) => eprintln!("❌ Could not fetch logs"),
+             }
         }
     }
 
