@@ -1,17 +1,17 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use uuid::Uuid;
 
-// Default Budget: $10.00 (in cents/micros if needed, using f64 for simplicity in hackathon)
 const DEFAULT_BUDGET: f64 = 10.0; 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentState {
     pub id: String,
-    pub balance_usdc: f64,    // Virtual Wallet
-    pub total_spend: f64,     // Metrics
-    pub payment_count: u64,   // Metrics
-    pub budget_limit: f64,    // Safety Cap
+    pub balance_usdc: f64,
+    pub total_spend: f64,
+    pub payment_count: u64,
+    pub budget_limit: f64,
     pub is_active: bool,
 }
 
@@ -19,7 +19,7 @@ impl AgentState {
     fn new(id: String) -> Self {
         Self {
             id,
-            balance_usdc: 100.0, // Pre-fund mock agents with $100
+            balance_usdc: 100.0, // Free 100 mock USDC
             total_spend: 0.0,
             payment_count: 0,
             budget_limit: DEFAULT_BUDGET,
@@ -28,22 +28,29 @@ impl AgentState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Invoice {
+    pub id: String,
+    pub amount: f64,
+    pub is_paid: bool,
+    pub agent_id: String,
+}
+
 #[derive(Clone, Default)]
 pub struct Ledger {
-    // DashMap allows concurrent access without locking the whole map
     store: Arc<DashMap<String, AgentState>>,
+    invoices: Arc<DashMap<String, Invoice>>,
 }
 
 impl Ledger {
     pub fn new() -> Self {
         Self {
             store: Arc::new(DashMap::new()),
+            invoices: Arc::new(DashMap::new()),
         }
     }
 
-    /// Registers an agent if they don't exist. Returns the (potentially new) state.
     pub fn register_or_get(&self, agent_id: &str) -> AgentState {
-        // Entry API handles the "check if exists, else insert" atomically
         let entry = self.store.entry(agent_id.to_string()).or_insert_with(|| {
             AgentState::new(agent_id.to_string())
         });
@@ -53,6 +60,49 @@ impl Ledger {
     pub fn get_state(&self, agent_id: &str) -> Option<AgentState> {
         self.store.get(agent_id).map(|r| r.value().clone())
     }
-    
-    // We will add debit/credit logic in Stage 4
+
+    /// Creates a new pending invoice
+    pub fn create_invoice(&self, agent_id: &str, amount: f64) -> Invoice {
+        let id = Uuid::new_v4().to_string();
+        let invoice = Invoice {
+            id: id.clone(),
+            amount,
+            is_paid: false,
+            agent_id: agent_id.to_string(),
+        };
+        self.invoices.insert(id.clone(), invoice.clone());
+        invoice
+    }
+
+    /// Attempts to settle an invoice using the agent's balance
+    pub fn pay_invoice(&self, invoice_id: &str, agent_id: &str) -> Result<f64, String> {
+        // 1. Validate Invoice
+        let mut invoice = self.invoices.get_mut(invoice_id).ok_or("Invoice invalid")?;
+        
+        if invoice.is_paid {
+            return Err("Invoice already paid".to_string());
+        }
+        if invoice.agent_id != agent_id {
+            return Err("Invoice belongs to another agent".to_string());
+        }
+
+        // 2. Validate Funds
+        let mut agent = self.store.get_mut(agent_id).ok_or("Agent not found")?;
+        
+        if agent.balance_usdc < invoice.amount {
+            return Err("Insufficient funds".to_string());
+        }
+        if (agent.total_spend + invoice.amount) > agent.budget_limit {
+            return Err("Budget limit exceeded".to_string());
+        }
+
+        // 3. Execute Transaction
+        agent.balance_usdc -= invoice.amount;
+        agent.total_spend += invoice.amount;
+        agent.payment_count += 1;
+        
+        invoice.is_paid = true;
+
+        Ok(agent.balance_usdc)
+    }
 }

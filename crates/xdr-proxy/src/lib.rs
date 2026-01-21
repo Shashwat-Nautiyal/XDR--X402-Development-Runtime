@@ -8,16 +8,17 @@ use axum::{
 };
 use reqwest::Client;
 use std::net::SocketAddr;
-// removed unused std::str::FromStr
 use std::time::Instant;
 use tower_http::trace::{self, TraceLayer};
 use tracing::{error, info, warn, Level};
 use url::Url;
 use xdr_ledger::Ledger;
+use serde_json::json; 
 
 // --- Constants ---
 const HEADER_UPSTREAM_HOST: &str = "x-upstream-host";
 const HEADER_AGENT_ID: &str = "x-agent-id";
+const HEADER_SIMULATE_PAYMENT: &str = "x-simulate-payment"; 
 
 // --- State ---
 #[derive(Clone)]
@@ -26,7 +27,7 @@ struct AppState {
     ledger: Ledger,
 }
 
-// --- Classification Enum (The Hook) ---
+// --- Classification Enum ---
 #[derive(Debug, Clone, PartialEq)]
 enum RequestType {
     AiInference,
@@ -37,7 +38,6 @@ enum RequestType {
 
 pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
-        // Disable automatic redirect following to act as a true proxy
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -58,7 +58,6 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     info!(target: "xdr_core", "🚀 XDR Proxy listening on http://{}", addr);
-    info!(target: "xdr_core", "ℹ️  Config: Set X-Upstream-Host or use Absolute URLs");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -77,7 +76,7 @@ async fn get_agent_status(
 }
 
 async fn proxy_handler(
-    state: axum::extract::State<AppState>,
+    State(state): State<AppState>,
     mut req: Request,
 ) -> impl IntoResponse {
     let start_time = Instant::now();
@@ -86,47 +85,77 @@ async fn proxy_handler(
     let agent_id = match req.headers().get(HEADER_AGENT_ID).and_then(|h| h.to_str().ok()) {
         Some(id) => id.to_string(),
         None => {
-            warn!(target: "xdr_proxy", "⚠️ Rejected request missing {}", HEADER_AGENT_ID);
-            return (
-                StatusCode::BAD_REQUEST, 
-                format!("Missing mandatory header: {}", HEADER_AGENT_ID)
-            ).into_response();
+            return (StatusCode::BAD_REQUEST, format!("Missing mandatory header: {}", HEADER_AGENT_ID)).into_response();
         }
     };
 
-    
-    // 2. REGISTER / UPDATE LEDGER
-    // Priority 1: Absolute URL (e.g. from curl proxy or RPC)
-    // Priority 2: X-Upstream-Host header + Requ// 2. REGISTER / UPDATE LEDGER
-    // This creates the agent in memory if it's their first request
-    let _agent_state = state.ledger.register_or_get(&agent_id);
+    // 2. REGISTER AGENT
+    state.ledger.register_or_get(&agent_id);
 
-    // RESOLVE UPSTREAM URL
+    // 3. [STAGE 4] x402 PAYMENT SEMANTICS ENGINE
+    // Trigger condition: Path contains "paid" OR Header set
+    let should_gate = req.uri().path().contains("paid") 
+                   || req.headers().contains_key(HEADER_SIMULATE_PAYMENT);
+
+    if should_gate {
+        // Check for L402 Token
+        let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
+        
+        match auth_header {
+            Some(token) if token.starts_with("L402") => {
+                // A. PAYMENT ATTEMPT
+                let invoice_id = token.replace("L402 ", "");
+                match state.ledger.pay_invoice(&invoice_id, &agent_id) {
+                    Ok(new_bal) => {
+                        info!(target: "xdr_payment", "💰 Payment Verified. Agent: {} Balance: ${:.2}", agent_id, new_bal);
+                        // Clean headers so upstream doesn't see our fake token
+                        req.headers_mut().remove("Authorization");
+                        // Fall through to proxy logic...
+                    },
+                    Err(e) => {
+                        warn!(target: "xdr_payment", "❌ Payment Rejected: {}", e);
+                        return (StatusCode::PAYMENT_REQUIRED, format!("Payment Failed: {}", e)).into_response();
+                    }
+                }
+            },
+            _ => {
+                // B. PAYMENT REQUIRED (CHALLENGE)
+                let amount = 0.01;
+                let invoice = state.ledger.create_invoice(&agent_id, amount);
+                
+                info!(target: "xdr_payment", "🛑 Gating Request. Invoice: {} Cost: ${}", invoice.id, amount);
+
+                let body = json!({
+                    "status": 402,
+                    "x402_invoice": invoice.id,
+                    "amount": format!("{:.2} USDC", amount),
+                    "chain": "cronos-testnet"
+                });
+
+                let mut resp = Json(body).into_response();
+                *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
+                resp.headers_mut().insert(
+                    "WWW-Authenticate", 
+                    HeaderValue::from_str(&format!("L402 token={}", invoice.id)).unwrap()
+                );
+                return resp;
+            }
+        }
+    }
+
+    // 4. RESOLVE UPSTREAM URL
     let upstream_url = match resolve_upstream_url(&req) {
         Ok(url) => url,
-        Err(err_msg) => {
-            warn!(target: "xdr_proxy", "Resolution failed: {}", err_msg);
-            return (StatusCode::BAD_REQUEST, err_msg).into_response();
-        }
+        Err(err_msg) => return (StatusCode::BAD_REQUEST, err_msg).into_response(),
     };
 
-    // 3. CLASSIFY REQUEST (The Hook)
-    // Currently a no-op, but ready for Stage 3 logic
+    // 5. CLASSIFY & LOG
     let req_type = classify_request(&upstream_url, req.method());
-    
-    info!(
-        target: "xdr_proxy", 
-        "➡️  [{}] {} {} (Agent: {})", 
-        format!("{:?}", req_type).to_uppercase(), 
-        req.method(), 
-        upstream_url,
-        agent_id
-    );
+    info!(target: "xdr_proxy", "➡️  [{:?}] {} {}", req_type, req.method(), upstream_url);
 
-    // 4. PREPARE REQUEST
-    // Strip hop-by-hop headers that might confuse the upstream
+    // 6. FORWARD UPSTREAM
+    // Safety: Strip hop-by-hop headers
     remove_hop_by_hop_headers(req.headers_mut());
-    // Ensure Host header matches the upstream, not localhost
     if let Some(host) = upstream_url.host_str() {
         req.headers_mut().insert("host", HeaderValue::from_str(host).unwrap());
     }
@@ -135,7 +164,6 @@ async fn proxy_handler(
     let headers = req.headers().clone();
     let body = req.into_body();
 
-    // 5. FORWARD UPSTREAM
     let response = match state.client
         .request(method, upstream_url.clone())
         .headers(headers)
@@ -144,33 +172,17 @@ async fn proxy_handler(
         .await 
     {
         Ok(res) => res,
-        Err(e) => {
-            error!(target: "xdr_proxy", "Upstream error: {}", e);
-            return (StatusCode::BAD_GATEWAY, format!("Upstream Error: {}", e)).into_response();
-        }
+        Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     };
 
-    // 6. PROCESS RESPONSE
+    // 7. RETURN RESPONSE
     let status = response.status();
     let mut resp_headers = response.headers().clone();
-    
-    // Safety: Remove hop-by-hop headers from UPSTREAM response before sending to DOWNSTREAM client
     remove_hop_by_hop_headers(&mut resp_headers);
-
     let resp_body = Body::from_stream(response.bytes_stream());
 
     let mut response_builder = Response::builder().status(status);
     *response_builder.headers_mut().unwrap() = resp_headers;
-    
-    info!(
-        target: "xdr_proxy",
-        agent_id = %agent_id,
-        "⬅️  [{}] {} ({}ms)", 
-        status,
-        upstream_url, 
-        start_time.elapsed().as_millis()
-    );
-
     response_builder.body(resp_body).unwrap()
 }
 
@@ -179,8 +191,8 @@ async fn proxy_handler(
 fn resolve_upstream_url(req: &Request) -> Result<Url, String> {
     let uri = req.uri();
 
-    // Case A: Absolute URL (e.g., "https://api.openai.com/v1/chat")
-    if let (Some(scheme), Some(host)) = (uri.scheme(), uri.host()) {
+    // Case A: Absolute URL
+    if let (Some(_scheme), Some(_host)) = (uri.scheme(), uri.host()) {
         let url_str = uri.to_string();
         return Url::parse(&url_str).map_err(|_| "Invalid Absolute URL".to_string());
     }
@@ -191,17 +203,13 @@ fn resolve_upstream_url(req: &Request) -> Result<Url, String> {
         .and_then(|v| v.to_str().ok())
         .ok_or("Missing X-Upstream-Host header or Absolute URL")?;
 
-    // Construct: https:// + {Header} + {Path} + {Query}
     let path = uri.path();
     let query = uri.query().map(|q| format!("?{}", q)).unwrap_or_default();
-    
-    // Default to HTTPS. A production tool might check for X-Forwarded-Proto
     let url_string = format!("https://{}{}{}", upstream_host, path, query);
     
     Url::parse(&url_string).map_err(|_| "Invalid Constructed URL".to_string())
 }
 
-// Placeholder for Stage 3 Logic
 fn classify_request(url: &Url, _method: &axum::http::Method) -> RequestType {
     let host = url.host_str().unwrap_or("");
     
@@ -216,19 +224,10 @@ fn classify_request(url: &Url, _method: &axum::http::Method) -> RequestType {
 }
 
 fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
-    // Standard hop-by-hop headers that must be dropped by proxies
     let to_remove = [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "content-length", // We are streaming, so length might change or be chunked
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailer", "transfer-encoding", "upgrade", "content-length", 
     ];
-
     for header in to_remove {
         headers.remove(header);
     }
