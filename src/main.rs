@@ -47,8 +47,31 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ChaosAction {
-    Enable,
     Disable,
+    /// Enable chaos with specific parameters
+    Enable {
+        /// RNG Seed for determinism
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        
+        /// Rate of 5xx/429 errors (0.0 - 1.0)
+        #[arg(long, default_value_t = 0.0)]
+        failure_rate: f64,
+        
+        /// Rate of Payment Rejections (0.0 - 1.0)
+        #[arg(long, default_value_t = 0.0)]
+        payment_failure: f64,
+
+        /// Rate of "Rug Pulls" (0.0 - 1.0)
+        #[arg(long, default_value_t = 0.0)]
+        rug_rate: f64,
+
+        #[arg(long, default_value_t = 0)]
+        min_latency: u64,
+        
+        #[arg(long, default_value_t = 0)]
+        max_latency: u64,
+    },
 }
 
 // 2. Main Entry Point
@@ -114,13 +137,16 @@ async fn main() -> Result<()> {
         }
         Commands::Chaos { action } => {
             let config = match action {
-                ChaosAction::Enable => ChaosConfig {
+                ChaosAction::Disable => ChaosConfig::default(),
+                ChaosAction::Enable { seed, failure_rate, payment_failure, rug_rate, min_latency, max_latency } => ChaosConfig {
                     enabled: true,
-                    failure_rate: 0.2,   // 20%
-                    min_latency_ms: 500,
-                    max_latency_ms: 1500,
+                    seed: *seed,
+                    global_failure_rate: *failure_rate,
+                    payment_failure_rate: *payment_failure,
+                    rug_rate: *rug_rate,
+                    min_latency_ms: *min_latency,
+                    max_latency_ms: *max_latency,
                 },
-                ChaosAction::Disable => ChaosConfig::default(), // enabled: false
             };
 
             let client = reqwest::Client::new();

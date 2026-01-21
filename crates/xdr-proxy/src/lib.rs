@@ -110,20 +110,7 @@ async fn proxy_handler(
 ) -> impl IntoResponse {
     let start_time = Instant::now();
     
-    // 1. Latency Injection (The Lag)
-    if let Some(delay) = state.chaos.inject_latency().await {
-        info!(target: "xdr_chaos", "⏳ Injecting Latency: {}ms", delay.as_millis());
-        tokio::time::sleep(delay).await;
-    }
-
-    // 2. Failure Injection (The Drop)
-    if let Some(status_code) = state.chaos.inject_failure() {
-        warn!(target: "xdr_chaos", "💥 Injecting Failure: {}", status_code);
-        return (
-            StatusCode::from_u16(status_code).unwrap(), 
-            format!("Chaos Simulation: {}", status_code)
-        ).into_response();
-    }
+    
 
     // 1. ENFORCE AGENT IDENTITY
     let agent_id = match req.headers().get(HEADER_AGENT_ID).and_then(|h| h.to_str().ok()) {
@@ -136,7 +123,27 @@ async fn proxy_handler(
     // 2. REGISTER AGENT
     state.ledger.register_or_get(&agent_id);
 
-    // 3. [STAGE 4] x402 PAYMENT SEMANTICS ENGINE
+    // 3. Latency Injection (The Lag)
+    // if let Some(delay) = state.chaos.inject_latency().await {
+    //     info!(target: "xdr_chaos", "⏳ Injecting Latency: {}ms", delay.as_millis());
+    //     tokio::time::sleep(delay).await;
+    // }
+    state.chaos.inject_latency().await;
+
+    // 4. Failure Injection (The Drop)
+    // if let Some(status_code) = state.chaos.inject_failure() {
+    //     warn!(target: "xdr_chaos", "💥 Injecting Failure: {}", status_code);
+    //     return (
+    //         StatusCode::from_u16(status_code).unwrap(), 
+    //         format!("Chaos Simulation: {}", status_code)
+    //     ).into_response();
+    // }
+    if let Some(status_code) = state.chaos.roll_network_failure() {
+        warn!(target: "xdr_chaos", "💥 Network Failure Injected: {}", status_code);
+        return (StatusCode::from_u16(status_code).unwrap(), "Chaos: Network Error").into_response();
+    }
+
+    // 5. x402 PAYMENT SEMANTICS ENGINE
     // Trigger condition: Path contains "paid" OR Header set
     let should_gate = req.uri().path().contains("paid") 
                    || req.headers().contains_key(HEADER_SIMULATE_PAYMENT);
@@ -152,6 +159,10 @@ async fn proxy_handler(
                 match state.ledger.pay_invoice(&invoice_id, &agent_id) {
                     Ok(new_bal) => {
                         info!(target: "xdr_payment", "💰 Payment Verified. Agent: {} Balance: ${:.2}", agent_id, new_bal);
+                        if state.chaos.roll_rug_pull() {
+                             warn!(target: "xdr_chaos", "💥 RUG PULL: Payment taken, service denied.");
+                             return (StatusCode::INTERNAL_SERVER_ERROR, "Chaos: Service Crashed After Payment").into_response();
+                        }
                         // Clean headers so upstream doesn't see our fake token
                         req.headers_mut().remove("Authorization");
                         // Fall through to proxy logic...
@@ -194,17 +205,17 @@ async fn proxy_handler(
         }
     }
 
-    // 4. RESOLVE UPSTREAM URL
+    // 6. RESOLVE UPSTREAM URL
     let upstream_url = match resolve_upstream_url(&req) {
         Ok(url) => url,
         Err(err_msg) => return (StatusCode::BAD_REQUEST, err_msg).into_response(),
     };
 
-    // 5. CLASSIFY & LOG
+    // 7. CLASSIFY & LOG
     let req_type = classify_request(&upstream_url, req.method());
     info!(target: "xdr_proxy", "➡️  [{:?}] {} {}", req_type, req.method(), upstream_url);
 
-    // 6. FORWARD UPSTREAM
+    // 8. FORWARD UPSTREAM
     // Safety: Strip hop-by-hop headers
     remove_hop_by_hop_headers(req.headers_mut());
     if let Some(host) = upstream_url.host_str() {
@@ -226,7 +237,7 @@ async fn proxy_handler(
         Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     };
 
-    // 7. RETURN RESPONSE
+    // 9. RETURN RESPONSE
     let status = response.status();
     let mut resp_headers = response.headers().clone();
     remove_hop_by_hop_headers(&mut resp_headers);
