@@ -3,6 +3,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 use anyhow::Result;
 use serde_json::json;
+use xdr_chaos::ChaosConfig;
 
 // 1. CLI Definition
 #[derive(Parser)]
@@ -81,12 +82,6 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Chaos { action } => {
-            match action {
-                ChaosAction::Enable => info!(event = "config_change", "Chaos mode ENABLED"),
-                ChaosAction::Disable => info!(event = "config_change", "Chaos mode DISABLED"),
-            }
-        }
         Commands::Status { agent } => {
             let url = format!("http://localhost:{}/_xdr/status/{}", cli.port, agent);
             match reqwest::get(&url).await {
@@ -114,6 +109,26 @@ async fn main() -> Result<()> {
             match res {
                 Ok(r) if r.status().is_success() => println!("✅ Budget updated for {}", agent),
                 Ok(r) => eprintln!("❌ Failed: {}", r.status()),
+                Err(e) => eprintln!("❌ Connection failed: {}", e),
+            }
+        }
+        Commands::Chaos { action } => {
+            let config = match action {
+                ChaosAction::Enable => ChaosConfig {
+                    enabled: true,
+                    failure_rate: 0.2,   // 20%
+                    min_latency_ms: 500,
+                    max_latency_ms: 1500,
+                },
+                ChaosAction::Disable => ChaosConfig::default(), // enabled: false
+            };
+
+            let client = reqwest::Client::new();
+            let url = format!("http://localhost:{}/_xdr/chaos", cli.port);
+            
+            match client.post(&url).json(&config).send().await {
+                Ok(r) if r.status().is_success() => println!("🌪️ Chaos configuration updated."),
+                Ok(r) => eprintln!("❌ Server error: {}", r.status()),
                 Err(e) => eprintln!("❌ Connection failed: {}", e),
             }
         }

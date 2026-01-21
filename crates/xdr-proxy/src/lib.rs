@@ -14,6 +14,7 @@ use tower_http::trace::{self, TraceLayer};
 use tracing::{error, info, warn, Level};
 use url::Url;
 use xdr_ledger::Ledger;
+use xdr_chaos::{ChaosEngine, ChaosConfig};
 use serde_json::json; 
 
 // --- Constants ---
@@ -26,6 +27,7 @@ const HEADER_SIMULATE_PAYMENT: &str = "x-simulate-payment";
 struct AppState {
     client: Client,
     ledger: Ledger,
+    chaos: ChaosEngine,
 }
 
 // --- Classification Enum ---
@@ -58,12 +60,14 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let ledger = Ledger::new();
-    let state = AppState { client, ledger };
+    let chaos = ChaosEngine::new();
+    let state = AppState { client, ledger, chaos };
 
     let app = Router::new()
         // 1. Management Routes (Internal)
         .route("/_xdr/status/:agent_id", get(get_agent_status))
         .route("/_xdr/budget/:agent_id", post(set_agent_budget))
+        .route("/_xdr/chaos", post(update_chaos_config))
         // 2. Proxy Routes (Catch-all)
         .route("/*path", any(proxy_handler)) 
         .layer(
@@ -92,12 +96,35 @@ async fn get_agent_status(
     }
 }
 
+async fn update_chaos_config(
+    State(state): State<AppState>,
+    Json(payload): Json<ChaosConfig>,
+) -> impl IntoResponse {
+    state.chaos.set_config(payload);
+    StatusCode::OK
+}
+
 async fn proxy_handler(
     State(state): State<AppState>,
     mut req: Request,
 ) -> impl IntoResponse {
     let start_time = Instant::now();
     
+    // 1. Latency Injection (The Lag)
+    if let Some(delay) = state.chaos.inject_latency().await {
+        info!(target: "xdr_chaos", "⏳ Injecting Latency: {}ms", delay.as_millis());
+        tokio::time::sleep(delay).await;
+    }
+
+    // 2. Failure Injection (The Drop)
+    if let Some(status_code) = state.chaos.inject_failure() {
+        warn!(target: "xdr_chaos", "💥 Injecting Failure: {}", status_code);
+        return (
+            StatusCode::from_u16(status_code).unwrap(), 
+            format!("Chaos Simulation: {}", status_code)
+        ).into_response();
+    }
+
     // 1. ENFORCE AGENT IDENTITY
     let agent_id = match req.headers().get(HEADER_AGENT_ID).and_then(|h| h.to_str().ok()) {
         Some(id) => id.to_string(),
