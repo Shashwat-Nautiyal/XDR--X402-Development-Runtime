@@ -74,7 +74,14 @@ impl Ledger {
         invoice
     }
 
-    /// Attempts to settle an invoice using the agent's balance
+    // Admin function to force-set a balance (for testing exhaustion)
+    pub fn set_balance(&self, agent_id: &str, amount: f64) {
+        let mut entry = self.store.entry(agent_id.to_string()).or_insert_with(|| {
+            AgentState::new(agent_id.to_string())
+        });
+        entry.balance_usdc = amount;
+    }
+
     pub fn pay_invoice(&self, invoice_id: &str, agent_id: &str) -> Result<f64, String> {
         // 1. Validate Invoice
         let mut invoice = self.invoices.get_mut(invoice_id).ok_or("Invoice invalid")?;
@@ -86,17 +93,20 @@ impl Ledger {
             return Err("Invoice belongs to another agent".to_string());
         }
 
-        // 2. Validate Funds
+        // 2. Validate Funds & Safety
         let mut agent = self.store.get_mut(agent_id).ok_or("Agent not found")?;
         
+        // CHECK 1: Wallet Balance
         if agent.balance_usdc < invoice.amount {
-            return Err("Insufficient funds".to_string());
+            return Err("Wallet Exhausted: Insufficient funds".to_string());
         }
+        
+        // CHECK 2: Safety Budget (Total Spend Cap)
         if (agent.total_spend + invoice.amount) > agent.budget_limit {
-            return Err("Budget limit exceeded".to_string());
+            return Err("Safety Limit: Budget cap exceeded".to_string());
         }
 
-        // 3. Execute Transaction
+        // 3. Execute
         agent.balance_usdc -= invoice.amount;
         agent.total_spend += invoice.amount;
         agent.payment_count += 1;

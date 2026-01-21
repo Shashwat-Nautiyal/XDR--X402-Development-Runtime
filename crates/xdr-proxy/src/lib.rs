@@ -3,8 +3,9 @@ use axum::{
     extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response, Json},
-    routing::{any, get},
+    routing::{any, get, post},
     Router,
+    
 };
 use reqwest::Client;
 use std::net::SocketAddr;
@@ -36,6 +37,21 @@ enum RequestType {
     Unknown,
 }
 
+#[derive(serde::Deserialize)]
+struct BudgetRequest {
+    amount: f64,
+}
+
+async fn set_agent_budget(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<BudgetRequest>,
+) -> impl IntoResponse {
+    state.ledger.set_balance(&agent_id, payload.amount);
+    info!(target: "xdr_core", "💰 Admin set balance for {} to ${}", agent_id, payload.amount);
+    StatusCode::OK
+}
+
 pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -47,6 +63,7 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         // 1. Management Routes (Internal)
         .route("/_xdr/status/:agent_id", get(get_agent_status))
+        .route("/_xdr/budget/:agent_id", post(set_agent_budget))
         // 2. Proxy Routes (Catch-all)
         .route("/*path", any(proxy_handler)) 
         .layer(
@@ -113,8 +130,15 @@ async fn proxy_handler(
                         // Fall through to proxy logic...
                     },
                     Err(e) => {
-                        warn!(target: "xdr_payment", "❌ Payment Rejected: {}", e);
-                        return (StatusCode::PAYMENT_REQUIRED, format!("Payment Failed: {}", e)).into_response();
+                       warn!(target: "xdr_payment", "🛑 BLOCKING: Agent {} - {}", agent_id, e);
+                        
+                        let body = json!({
+                            "status": 402,
+                            "error": "Payment Failed",
+                            "reason": e, // "Wallet Exhausted" or "Safety Limit"
+                            "agent": agent_id
+                        });
+                        return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
                     }
                 }
             },

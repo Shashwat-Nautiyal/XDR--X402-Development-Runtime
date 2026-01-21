@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 use anyhow::Result;
+use serde_json::json;
 
 // 1. CLI Definition
 #[derive(Parser)]
@@ -34,6 +35,12 @@ enum Commands {
         /// The Agent ID to query
         #[arg(short, long)]
         agent: String,
+    },
+    Budget {
+        #[arg(short, long)]
+        agent: String,
+        #[arg(long)]
+        set: f64,
     },
 }
 
@@ -92,6 +99,21 @@ async fn main() -> Result<()> {
                         eprintln!("❌ Error [{}]: Agent '{}' not found.", resp.status(), agent);
                     }
                 }
+                Err(e) => eprintln!("❌ Connection failed: {}", e),
+            }
+        }
+        Commands::Budget { agent, set } => {
+            let client = reqwest::Client::new();
+            let url = format!("http://localhost:{}/_xdr/budget/{}", cli.port, agent);
+            
+            let res = client.post(&url)
+                .json(&json!({ "amount": set }))
+                .send()
+                .await;
+
+            match res {
+                Ok(r) if r.status().is_success() => println!("✅ Budget updated for {}", agent),
+                Ok(r) => eprintln!("❌ Failed: {}", r.status()),
                 Err(e) => eprintln!("❌ Connection failed: {}", e),
             }
         }
