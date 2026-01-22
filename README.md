@@ -20,6 +20,32 @@ If you are building an autonomous agent that pays for API access (LLMs, Data, Co
 
 XDR is a high-performance Reverse Proxy & Runtime written in Rust. It sits between your agent and the internet, mocking the Cronos blockchain and enforcing safety rails.
 
+
+## 🏗️ Architecture
+XDR is a modular workspace built for speed and safety.
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant XDR as XDR Runtime
+    participant Chaos as Chaos Engine
+    participant Ledger
+    participant Upstream
+    Agent->>XDR: POST /v1/chat (No Token)
+    XDR->>Chaos: Roll Dice (Latency/Failure)
+    alt Chaos Triggered
+        XDR-->>Agent: 503 Service Unavailable
+    else Normal Flow
+        XDR->>Ledger: Check Budget
+        XDR-->>Agent: 402 Payment Required (L402 Invoice)
+        
+        Agent->>XDR: POST /v1/chat (With L402 Token)
+        XDR->>Ledger: Deduct Balance & Mint Fake Tx
+        XDR->>Upstream: Forward Request
+        Upstream-->>XDR: 200 OK
+        XDR-->>Agent: 200 OK
+    end
+```
+
 ---
 
 ## ✨ Key Capabilities
@@ -106,31 +132,6 @@ What you see:
    Agent: agent-007 | Duration: 150ms
    - [Payment] Payment Confirmed on Cronos (Testnet). Tx: 0x8f2a...9b1
    - [Info] Wallet: 99.99 USDC | Chain: 338
-```
-
-## 🏗️ Architecture
-XDR is a modular workspace built for speed and safety.
-```mermaid
-sequenceDiagram
-    participant Agent
-    participant XDR as XDR Runtime
-    participant Chaos as Chaos Engine
-    participant Ledger
-    participant Upstream
-    Agent->>XDR: POST /v1/chat (No Token)
-    XDR->>Chaos: Roll Dice (Latency/Failure)
-    alt Chaos Triggered
-        XDR-->>Agent: 503 Service Unavailable
-    else Normal Flow
-        XDR->>Ledger: Check Budget
-        XDR-->>Agent: 402 Payment Required (L402 Invoice)
-        
-        Agent->>XDR: POST /v1/chat (With L402 Token)
-        XDR->>Ledger: Deduct Balance & Mint Fake Tx
-        XDR->>Upstream: Forward Request
-        Upstream-->>XDR: 200 OK
-        XDR-->>Agent: 200 OK
-    end
 ```
 
 ## 📦 Tech Stack
