@@ -32,6 +32,7 @@ struct AppState {
     ledger: Ledger,
     chaos: ChaosEngine,
     traces: Arc<Mutex<VecDeque<Trace>>>,
+    network: String,
 }
 
 // --- Classification Enum ---
@@ -58,7 +59,7 @@ async fn set_agent_budget(
     StatusCode::OK
 }
 
-pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_server(port: u16, network:String) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -66,7 +67,7 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let ledger = Ledger::new();
     let chaos = ChaosEngine::new();
     let traces = Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
-    let state = AppState { client, ledger, chaos, traces };
+    let state = AppState { client, ledger, chaos, traces, network: network.clone(), };
 
     let app = Router::new()
         // 1. Management Routes (Internal)
@@ -84,7 +85,7 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    info!(target: "xdr_core", "🚀 XDR Proxy listening on http://{}", addr);
+    info!(target: "xdr_core", "🌍 Network Mode: {} (Chain ID: 338)", network);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -206,9 +207,20 @@ async fn proxy_handler(
                 }
 
                 let invoice_id = token.replace("L402 ", "");
-                match state.ledger.pay_invoice(&invoice_id, &agent_id) {
-                    Ok(bal) => {
-                        record!(EventCategory::Payment, format!("Payment accepted. Bal: ${:.2}", bal));
+               match state.ledger.pay_invoice(&invoice_id, &agent_id, &state.network) {
+                    Ok(receipt) => {
+                        // LOG THE CRONOS DATA
+                        record!(EventCategory::Payment, format!(
+                            "Payment Confirmed on Cronos (Testnet). Tx: {} | Block: {}", 
+                            receipt.tx_hash, receipt.block_height
+                        ));
+                        
+                        // Trace the economics
+                        record!(EventCategory::Info, format!(
+                            "Wallet: {:.2} USDC | Chain: {}", 
+                            receipt.new_balance, receipt.chain_id
+                        ));
+                        record!(EventCategory::Payment, format!("Payment accepted. Bal: ${:.2}", receipt.new_balance));
                         
                         // Rug Chaos
                         if state.chaos.roll_rug_pull() {
@@ -239,7 +251,17 @@ async fn proxy_handler(
                 state.traces.lock().unwrap().push_back(trace);
                 
                 // Copy the L402 response logic here
-                let body = json!({ "status": 402, "x402_invoice": invoice.id });
+                let body = json!({
+                    "status": 402,
+                    "x402_invoice": invoice.id,
+                    "amount": "0.01",
+                    "currency": "USDC",
+                    "chain": "cronos",
+                    "network": state.network,
+                    "chain_id": 338, // Cronos Testnet ID
+                    "payment_address": "0x000000000000000000000000000000000000dead" // Burn addr for mock
+                });
+                
                 let mut resp = Json(body).into_response();
                 *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
                 resp.headers_mut().insert("WWW-Authenticate", HeaderValue::from_str(&format!("L402 token={}", invoice.id)).unwrap());

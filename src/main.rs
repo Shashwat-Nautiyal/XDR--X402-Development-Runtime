@@ -26,7 +26,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the XDR runtime server
-    Run,
+    Run{
+        /// Select Network Environment
+        #[arg(long, default_value = "cronos-testnet")]
+        network: String,
+    },
     /// Manage Chaos engineering settings
     Chaos {
         #[command(subcommand)]
@@ -101,7 +105,7 @@ async fn main() -> Result<()> {
 
     // 4. Command Router
     match &cli.command {
-        Commands::Run => {
+        Commands::Run{network} => {
             info!(
                 target: "xdr_core",
                 event = "startup",
@@ -110,7 +114,7 @@ async fn main() -> Result<()> {
             );
             
             // Delegate to the xdr-proxy crate
-            if let Err(e) = xdr_proxy::run_server(cli.port).await {
+            if let Err(e) = xdr_proxy::run_server(cli.port, network.clone()).await {
                 tracing::error!("Server crashed: {}", e);
                 std::process::exit(1);
             }

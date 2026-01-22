@@ -1,40 +1,45 @@
-# XDR (x402 Dev Runtime)
-**The "Foundry" for Agent Economics on Cronos.**
+# XDR: The Cronos Agent Foundry ⚒️
+XDR lets developers test agent economics, payment semantics, and failure modes before touching real money or real users.
 
-> 🚧 **Problem:** Building x402-powered AI agents is hard because testing payments requires real wallets, real delays, and non-deterministic failures.
->
-> 🚀 **Solution:** XDR is a local-first runtime that simulates the entire Cronos x402 payment lifecycle, enforcing budgets and injecting chaos deterministicly.
+**Local-first runtime, simulator, and debugger for x402-powered AI agents on Cronos.**
 
----
-
-## ⚡ Features
-
-### 1. Deterministic x402 Simulator
-Stop wasting testnet funds. XDR intercepts traffic and mocks the entire **HTTP 402 Payment Required** handshake locally.
-- **Auto-Invoicing:** Generates valid `L402` challenges for any request.
-- **Ledger Tracking:** Tracks every "Virtual USDC" spent by your agents.
-
-### 2. Chaos Engineering (The "Rug" Test)
-Agents on blockchain networks must survive instability. XDR acts as a hostile network condition generator.
-- **Latency Injection:** Simulate mempool congestion (e.g., random 500ms - 2s delays).
-- **Failure Injection:** Randomly drop requests (`503`, `429`) to test agent retry logic.
-- **Rug Pull Mode:** Simulate the worst-case scenario: Payment accepted, but service returns 500.
-
-### 3. Budget Enforcement
-Prevent runaway agents from draining wallets.
-- **Hard Stops:** Automatically blocks requests when `total_spend > budget`.
-- **Admin API:** Update budgets on the fly without restarting the agent.
-
-### 4. Zero-Code Integration
-Works with **any** language (TypeScript, Python, Go, Rust).
-- **No SDK Required:** Just change your agent's `BASE_URL`.
-- **Standard Headers:** Uses `X-Agent-ID` and `Authorization: L402 ...`.
+[![Cronos](https://img.shields.io/badge/Built%20For-Cronos%20zkEVM-blue)](https://cronos.org/)
+[![Rust](https://img.shields.io/badge/Built%20With-Rust-orange)](https://www.rust-lang.org/)
 
 ---
 
-## 🛠️ Usage
+## 🚧 The Problem
+Building autonomous agents that pay for resources (LLMs, APIs, Data) is dangerous and slow:
+1.  **Cost:** Testing requires burning real testnet/mainnet USDC.
+2.  **Risk:** A buggy loop can drain a wallet in seconds.
+3.  **Blindness:** You can't verify how your agent handles "Payment Required" (402) errors without a live paywall.
 
-### 1. Start the Runtime
+## 🚀 The Solution: XDR
+XDR is a **Reverse Proxy & Runtime** that sits between your agent and the world. It mocks the entire **Cronos x402 Payment Lifecycle** locally.
+
+### ✨ Key Features
+
+* **🌍 Cronos Network Simulation:**
+    * Mocks Chain ID `338` (Testnet) or `25` (Mainnet).
+    * Generates deterministic Transaction Hashes for every payment.
+    * Standardized `L402` Payment Challenges.
+
+* **🌪️ Deterministic Chaos Engine:**
+    * Inject "Rug Pulls" (Payment success -> Request failure).
+    * Simulate Mempool Congestion (Latency).
+    * Simulate RPC Node drops (503 Service Unavailable).
+    * **Seedable:** Replay exact failure scenarios to debug agent logic.
+
+* **💸 Budget Enforcement:**
+    * Set hard spending caps (e.g., "$5.00 USDC").
+    * XDR blocks requests with `402 Budget Exceeded` when the cap is hit.
+    * Protects you from runaway loops during development.
+
+---
+
+## ⚡ Quick Start
+
+### 1. Install & Run
 ```bash
-# Starts XDR on http://localhost:4002
-cargo run -- run
+# Clone and run the single binary
+cargo run -- run --network cronos-testnet

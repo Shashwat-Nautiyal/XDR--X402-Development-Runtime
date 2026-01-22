@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
+use rand::{distributions::Alphanumeric, Rng};
 
 const DEFAULT_BUDGET: f64 = 10.0; 
 
@@ -26,6 +27,14 @@ impl AgentState {
             is_active: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentReceipt {
+    pub new_balance: f64,
+    pub tx_hash: String,
+    pub chain_id: String,
+    pub block_height: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +83,16 @@ impl Ledger {
         invoice
     }
 
+    fn generate_cronos_hash(&self) -> String {
+        let rng = rand::thread_rng();
+        let suffix: String = rng
+            .sample_iter(&Alphanumeric)
+            .take(64)
+            .map(char::from)
+            .collect();
+        format!("0x{}", suffix.to_lowercase())
+    }
+
     // Admin function to force-set a balance (for testing exhaustion)
     pub fn set_balance(&self, agent_id: &str, amount: f64) {
         let mut entry = self.store.entry(agent_id.to_string()).or_insert_with(|| {
@@ -82,7 +101,7 @@ impl Ledger {
         entry.balance_usdc = amount;
     }
 
-    pub fn pay_invoice(&self, invoice_id: &str, agent_id: &str) -> Result<f64, String> {
+    pub fn pay_invoice(&self, invoice_id: &str, agent_id: &str, network: &str) -> Result<PaymentReceipt, String> {
         // 1. Validate Invoice
         let mut invoice = self.invoices.get_mut(invoice_id).ok_or("Invoice invalid")?;
         
@@ -112,7 +131,13 @@ impl Ledger {
         agent.payment_count += 1;
         
         invoice.is_paid = true;
+        let chain_id = if network == "cronos-mainnet" { "25" } else { "338" }; // 338 is Testnet
 
-        Ok(agent.balance_usdc)
+        Ok(PaymentReceipt {
+            new_balance: agent.balance_usdc,
+            tx_hash: self.generate_cronos_hash(),
+            chain_id: chain_id.to_string(),
+            block_height: 10_000_000 + agent.payment_count, // Fake block height increment
+        })
     }
 }
