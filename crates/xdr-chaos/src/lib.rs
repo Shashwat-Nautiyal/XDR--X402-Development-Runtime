@@ -62,7 +62,13 @@ impl ChaosEngine {
         // Re-seed the RNG whenever config changes to ensure replayability from this point
         state.rng = ChaCha8Rng::seed_from_u64(new_config.seed);
         state.config = new_config;
-        info!("🌪️ Chaos Re-Seeded & Updated: {:?}", state.config);
+        info!("Chaos Re-Seeded & Updated: {:?}", state.config);
+    }
+
+    /// Returns a clone of the current chaos configuration (for TUI display)
+    pub fn get_config(&self) -> ChaosConfig {
+        let state = self.state.lock().unwrap();
+        state.config.clone()
     }
 
     /// Roll dice for generic network failure (503/429)

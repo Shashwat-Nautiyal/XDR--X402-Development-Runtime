@@ -101,6 +101,11 @@ impl Ledger {
         entry.balance_usdc = amount;
     }
 
+    /// Returns a snapshot of all registered agents (for TUI display)
+    pub fn list_all_agents(&self) -> Vec<AgentState> {
+        self.store.iter().map(|r| r.value().clone()).collect()
+    }
+
     pub fn pay_invoice(&self, invoice_id: &str, agent_id: &str, network: &str) -> Result<PaymentReceipt, String> {
         // 1. Validate Invoice
         let mut invoice = self.invoices.get_mut(invoice_id).ok_or("Invoice invalid")?;

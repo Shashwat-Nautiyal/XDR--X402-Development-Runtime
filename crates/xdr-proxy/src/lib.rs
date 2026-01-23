@@ -59,15 +59,20 @@ async fn set_agent_budget(
     StatusCode::OK
 }
 
-pub async fn run_server(port: u16, network:String) -> Result<(), Box<dyn std::error::Error>> {
+/// Runs the XDR proxy server with externally provided state.
+/// This allows the TUI to share the same Ledger, ChaosEngine, and trace buffer.
+pub async fn run_server(
+    port: u16, 
+    network: String,
+    ledger: Ledger,
+    chaos: ChaosEngine,
+    traces: Arc<Mutex<VecDeque<Trace>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
-    let ledger = Ledger::new();
-    let chaos = ChaosEngine::new();
-    let traces = Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
-    let state = AppState { client, ledger, chaos, traces, network: network.clone(), };
+    let state = AppState { client, ledger, chaos, traces, network: network.clone() };
 
     let app = Router::new()
         // 1. Management Routes (Internal)

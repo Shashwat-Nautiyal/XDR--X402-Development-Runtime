@@ -1,0 +1,277 @@
+This is the Final Polish. A TUI transforms your tool from "just a script" to a "command center."
+To do this cleanly without breaking your stable backend, we need to perform a Dependency Injection Refactor.
+
+Current State: xdr-proxy creates its own state (Ledger, Chaos, etc.) inside run_server.
+New State: main.rs will create the state, then pass it to both the Proxy (background task) and the TUI (foreground task).
+
+Step 1: Add Dependencies
+We need ratatui and crossterm.
+
+File: xdr/Cargo.toml (Workspace Root)
+
+Ini, TOML
+
+[dependencies]
+ratatui = "0.26"
+crossterm = "0.27"
+File: crates/xdr-tui/Cargo.toml (Create this new crate)
+
+
+File: crates/xdr-tui/Cargo.toml
+
+Ini, TOML
+
+[package]
+name = "xdr-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.26"
+crossterm = "0.27"
+xdr-ledger = { path = "../xdr-ledger" }
+xdr-chaos = { path = "../xdr-chaos" }
+xdr-trace = { path = "../xdr-trace" }
+tokio = { version = "1.0", features = ["full"] }
+Step 2: Refactor xdr-proxy to Accept State
+We need to "hoist" the state creation out of the proxy so the TUI can share it.
+
+File: crates/xdr-proxy/src/lib.rs
+
+Change the run_server signature and remove internal instantiation.
+
+Rust
+
+// ... imports ...
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use xdr_trace::Trace; // Ensure this is imported
+
+// ... AppState struct ...
+
+// 1. UPDATE SIGNATURE
+pub async fn run_server(
+    port: u16, 
+    network: String,
+    ledger: Ledger,           // Passed in
+    chaos: ChaosEngine,       // Passed in
+    traces: Arc<Mutex<VecDeque<Trace>>> // Passed in
+) -> Result<(), Box<dyn std::error::Error>> {
+    
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    // 2. USE PASSED STATE
+    let state = AppState { 
+        client, 
+        ledger, 
+        chaos, 
+        traces,
+        network: network.clone(),
+    };
+    
+    info!(target: "xdr_core", "🌍 Network Mode: {} (Chain ID: 338)", network);
+
+    let app = Router::new()
+        .route("/_xdr/status/:agent_id", get(get_agent_status))
+        // ... all your routes ...
+        .route("/*path", any(proxy_handler)) 
+        // ... layers ...
+        .with_state(state);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    info!(target: "xdr_core", "🚀 XDR Proxy listening on http://{}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+Step 3: Build the TUI (crates/xdr-tui)
+This module draws the "Cockpit".
+
+File: crates/xdr-tui/src/lib.rs
+
+Rust
+
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{prelude::*, widgets::*};
+use std::{error::Error, io, sync::{Arc, Mutex}, collections::VecDeque, time::Duration};
+use xdr_ledger::Ledger;
+use xdr_chaos::ChaosEngine;
+use xdr_trace::Trace;
+
+pub struct App {
+    pub ledger: Ledger,
+    pub chaos: ChaosEngine,
+    pub traces: Arc<Mutex<VecDeque<Trace>>>,
+}
+
+pub async fn run_tui(app_state: App) -> Result<(), Box<dyn Error>> {
+    // 1. Setup Terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // 2. Run Loop
+    let res = run_app(&mut terminal, app_state).await;
+
+    // 3. Restore Terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    terminal.show_cursor()?;
+
+    if let Err(err) = res {
+        println!("{:?}", err)
+    }
+
+    Ok(())
+}
+
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: App) -> io::Result<()> {
+    loop {
+        terminal.draw(|f| ui(f, &app))?;
+
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if let KeyCode::Char('q') = key.code {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn ui(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(0),    // Content
+            Constraint::Length(3), // Footer
+        ])
+        .split(f.size());
+
+    // --- HEADER ---
+    let chaos_config = app.chaos.get_config();
+    let status_text = if chaos_config.enabled {
+        format!(" CHAOS: ON (Rate: {:.0}%) | Network: Cronos Testnet ", chaos_config.global_failure_rate * 100.0)
+    } else {
+        " CHAOS: OFF | Network: Cronos Testnet ".to_string()
+    };
+    
+    let title = Paragraph::new(status_text)
+        .block(Block::default().borders(Borders::ALL).title(" XDR Control Plane "))
+        .style(Style::default().fg(if chaos_config.enabled { Color::Red } else { Color::Green }));
+    f.render_widget(title, chunks[0]);
+
+    // --- CONTENT SPLIT ---
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    // LEFT: AGENTS
+    // Note: DashMap iteration is tricky in UI, simplified here
+    // In production you'd collect to vec, but this works for demo
+    let mut agents = Vec::new();
+    // We can't easily iterate DashMap in TUI draw loop without locking issues, 
+    // so we just display a placeholder or need to implement a 'list_agents' on Ledger
+    // For Hackathon speed, let's just list Traces on Left and Chaos on Right if Ledger is hard to iterate publically.
+    // Assuming you added a `list_all()` to Ledger, strictly:
+    // For now, let's render the Trace Log on the Left.
+    
+    let traces_lock = app.traces.lock().unwrap();
+    let items: Vec<ListItem> = traces_lock.iter().rev().take(20).map(|t| {
+        let style = match t.status_code.unwrap_or(0) {
+            200..=299 => Style::default().fg(Color::Green),
+            402 => Style::default().fg(Color::Yellow),
+            _ => Style::default().fg(Color::Red),
+        };
+        let content = format!("[{}] {} {}", t.status_code.unwrap_or(0), t.method, t.url);
+        ListItem::new(content).style(style)
+    }).collect();
+
+    let logs = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Live Traffic (Last 20) "));
+    f.render_widget(logs, main_chunks[0]);
+
+    // RIGHT: STATISTICS / HELP
+    let help_text = vec![
+        Line::from("Controls:"),
+        Line::from(" [q] Quit XDR"),
+        Line::from(""),
+        Line::from("CLI Commands:"),
+        Line::from(" xdr chaos enable ..."),
+        Line::from(" xdr budget --set ..."),
+    ];
+    let help = Paragraph::new(help_text)
+        .block(Block::default().borders(Borders::ALL).title(" Info "));
+    f.render_widget(help, main_chunks[1]);
+}
+Step 4: Update main.rs (The Integration)
+This is where we stitch the "Head" (TUI) to the "Body" (Proxy).
+
+File: src/main.rs
+
+You need to import std::collections::VecDeque, std::sync::{Arc, Mutex}, and xdr_trace::Trace.
+
+Rust
+
+// ... imports ...
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use xdr_trace::Trace;
+
+// ... inside main ...
+
+        Commands::Run { network } => {
+            // 1. Create Shared State
+            let ledger = xdr_ledger::Ledger::new();
+            let chaos = xdr_chaos::ChaosEngine::new();
+            let traces: Arc<Mutex<VecDeque<Trace>>> = Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
+
+            // 2. Clone for Proxy
+            let proxy_ledger = ledger.clone();
+            let proxy_chaos = chaos.clone();
+            let proxy_traces = traces.clone();
+            let proxy_network = network.clone();
+            let proxy_port = cli.port;
+
+            // 3. Spawn Proxy in Background Task
+            tokio::spawn(async move {
+                if let Err(e) = xdr_proxy::run_server(
+                    proxy_port, 
+                    proxy_network, 
+                    proxy_ledger, 
+                    proxy_chaos, 
+                    proxy_traces
+                ).await {
+                    eprintln!("Proxy crashed: {}", e);
+                }
+            });
+
+            // 4. Run TUI in Foreground (Main Thread)
+            // Note: We need a slight delay to let proxy bind, just for UX
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            
+            let tui_app = xdr_tui::App {
+                ledger,
+                chaos,
+                traces
+            };
+
+            if let Err(e) = xdr_tui::run_tui(tui_app).await {
+                 eprintln!("TUI Error: {}", e);
+            }
+            
+            // When TUI quits (user hits 'q'), the program exits
+            println!("👋 Shutting down XDR...");
+        }

@@ -13,6 +13,7 @@ xdr-proxy = { path = "crates/xdr-proxy" }
 xdr-chaos = { path = "crates/xdr-chaos" }
 xdr-ledger = { path = "crates/xdr-ledger" }
 xdr-trace = { path = "crates/xdr-trace" }
+xdr-tui = { path = "crates/xdr-tui" }
 
 # Async Runtime
 tokio = { version = "1.36", features = ["full"] }

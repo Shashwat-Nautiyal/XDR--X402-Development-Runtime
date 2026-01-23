@@ -5,6 +5,8 @@ use anyhow::Result;
 use serde_json::json;
 use xdr_chaos::ChaosConfig;
 use xdr_trace::Trace;
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
 
 // 1. CLI Definition
 #[derive(Parser)]
@@ -113,11 +115,48 @@ async fn main() -> Result<()> {
                 msg = "Starting XDR Runtime"
             );
             
-            // Delegate to the xdr-proxy crate
-            if let Err(e) = xdr_proxy::run_server(cli.port, network.clone()).await {
-                tracing::error!("Server crashed: {}", e);
-                std::process::exit(1);
+            // 1. Create Shared State (owned by main, shared with proxy and TUI)
+            let ledger = xdr_ledger::Ledger::new();
+            let chaos = xdr_chaos::ChaosEngine::new();
+            let traces: Arc<Mutex<VecDeque<Trace>>> = Arc::new(Mutex::new(VecDeque::with_capacity(1000)));
+
+            // 2. Clone for Proxy (runs in background task)
+            let proxy_ledger = ledger.clone();
+            let proxy_chaos = chaos.clone();
+            let proxy_traces = traces.clone();
+            let proxy_network = network.clone();
+            let proxy_port = cli.port;
+
+            // 3. Spawn Proxy in Background Task
+            tokio::spawn(async move {
+                if let Err(e) = xdr_proxy::run_server(
+                    proxy_port, 
+                    proxy_network, 
+                    proxy_ledger, 
+                    proxy_chaos, 
+                    proxy_traces
+                ).await {
+                    eprintln!("Proxy crashed: {}", e);
+                }
+            });
+
+            // 4. Run TUI in Foreground (Main Thread)
+            // Brief delay to let proxy bind to port
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            
+            let tui_app = xdr_tui::App {
+                ledger,
+                chaos,
+                traces,
+                network: network.clone(),
+            };
+
+            if let Err(e) = xdr_tui::run_tui(tui_app).await {
+                 eprintln!("TUI Error: {}", e);
             }
+            
+            // When TUI quits (user hits 'q'), the program exits
+            println!("Shutting down XDR...");
         }
         Commands::Status { agent } => {
             let url = format!("http://localhost:{}/_xdr/status/{}", cli.port, agent);
