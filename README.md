@@ -6,6 +6,9 @@
 
 Building agents that spend money is dangerous. Testing them on mainnet is expensive. XDR lets you simulate the entire Cronos x402 payment lifecycle locally—deterministic, free, and safe.
 
+
+**[Watch the XDR Demo Video](https://drive.google.com/file/d/1YQvElC11huTy3zoDGaqy0mja-wTq0PzZ/view?usp=sharing)** — See the chaos engine and L402 payment flow in action.
+
 ---
 
 ## 🚧 The Developer Pain
