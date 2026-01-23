@@ -1,6 +1,4 @@
 use clap::{Parser, Subcommand};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
 use anyhow::Result;
 use serde_json::json;
 use xdr_chaos::ChaosConfig;
@@ -95,25 +93,11 @@ enum ChaosAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // 3. Initialize Structured Logging (JSON)
-    let subscriber = FmtSubscriber::builder()
-        // Use JSON formatting for machine-readability (good for future TUI)
-        .json() 
-        .with_max_level(if cli.verbose { Level::DEBUG } else { Level::INFO })
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
-
     // 4. Command Router
     match &cli.command {
         Commands::Run{network} => {
-            info!(
-                target: "xdr_core",
-                event = "startup",
-                port = cli.port,
-                msg = "Starting XDR Runtime"
-            );
+            // NOTE: No tracing subscriber when running TUI - it corrupts the display
+            // Tracing is only used for non-TUI commands
             
             // 1. Create Shared State (owned by main, shared with proxy and TUI)
             let ledger = xdr_ledger::Ledger::new();

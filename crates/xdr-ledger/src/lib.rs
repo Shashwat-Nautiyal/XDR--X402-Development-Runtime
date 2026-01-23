@@ -77,6 +77,11 @@ impl Ledger {
         self.store.get(agent_id).map(|r| r.value().clone())
     }
 
+    pub fn list_agents(&self) -> Vec<AgentState> {
+        // Collect all agents from the DashMap into a Vector
+        self.store.iter().map(|r| r.value().clone()).collect()
+    }
+
     /// Creates a new pending invoice
     pub fn create_invoice(&self, agent_id: &str, amount: f64) -> Invoice {
         let id = Uuid::new_v4().to_string();
