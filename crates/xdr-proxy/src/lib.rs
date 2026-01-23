@@ -192,8 +192,15 @@ async fn proxy_handler(
     trace.agent_id = agent_id.clone(); // Update correct ID
     record!(EventCategory::Info, format!("Agent identified: {}", agent_id));
 
-    // 4. REGISTER
-    state.ledger.register_or_get(&agent_id);
+    // 4. REGISTER (with explicit funding event for new agents)
+    let (agent_state, is_new_agent) = state.ledger.register_or_get(&agent_id);
+    if is_new_agent {
+        record!(EventCategory::Payment, format!(
+            "FUNDED: Agent {} received $100.00 USDC (Welcome bonus)", 
+            agent_id
+        ));
+    }
+    record!(EventCategory::Info, format!("Balance: ${:.2} USDC", agent_state.balance_usdc));
 
     // 5. PAYMENT LOGIC
     let should_gate = req.uri().path().contains("paid") 
@@ -316,6 +323,12 @@ async fn proxy_handler(
     // 9. RETURN RESPONSE
     let status = response.status();
     record!(EventCategory::Upstream, format!("Upstream responded: {}", status));
+    
+    // Log final balance after request completes
+    if let Some(final_state) = state.ledger.get_state(&agent_id) {
+        record!(EventCategory::Info, format!("Balance after request: ${:.2} USDC", final_state.balance_usdc));
+    }
+    
     trace.finish(status.as_u16());
 
     {

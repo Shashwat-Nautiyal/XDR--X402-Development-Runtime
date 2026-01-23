@@ -148,7 +148,6 @@ async fn main() -> Result<()> {
                 ledger,
                 chaos,
                 traces,
-                network: network.clone(),
             };
 
             if let Err(e) = xdr_tui::run_tui(tui_app).await {

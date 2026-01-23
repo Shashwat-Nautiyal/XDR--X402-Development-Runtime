@@ -59,11 +59,18 @@ impl Ledger {
         }
     }
 
-    pub fn register_or_get(&self, agent_id: &str) -> AgentState {
+    /// Registers a new agent or returns existing state.
+    /// Returns (AgentState, is_new) where is_new indicates first-time registration.
+    pub fn register_or_get(&self, agent_id: &str) -> (AgentState, bool) {
+        // Check if agent already exists
+        if let Some(existing) = self.store.get(agent_id) {
+            return (existing.value().clone(), false);
+        }
+        // New agent - create with initial funding
         let entry = self.store.entry(agent_id.to_string()).or_insert_with(|| {
             AgentState::new(agent_id.to_string())
         });
-        entry.value().clone()
+        (entry.value().clone(), true)
     }
 
     pub fn get_state(&self, agent_id: &str) -> Option<AgentState> {
